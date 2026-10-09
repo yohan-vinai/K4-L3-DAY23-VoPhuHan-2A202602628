@@ -19,6 +19,8 @@ CÂU HỎI PHẢI TRẢ LỜI TRƯỚC KHI VIẾT (ghi câu trả lời vào rep
   Con số đó nằm TRONG RTO của bạn. Muốn RTO 5 phút thì được phép chọn interval bao nhiêu?
 """
 import argparse
+import concurrent.futures
+import datetime as dt
 import json
 import pathlib
 import time
@@ -29,13 +31,84 @@ URL = {"a": "http://127.0.0.1:8001", "b": "http://127.0.0.1:8002"}
 
 
 def probe(region: str, timeout: float) -> tuple[bool, str]:
-    """TODO: trả về (ready, reason). Timeout PHẢI có — netblock làm request treo mãi."""
-    raise NotImplementedError
+    """Return readiness and a useful reason; the timeout bounds SIGSTOP/netblock probes."""
+    try:
+        response = httpx.get(f"{URL[region]}/readyz", timeout=timeout)
+        try:
+            body = response.json()
+        except ValueError:
+            body = {}
+        if response.status_code == 200:
+            return True, "ready"
+        reasons = body.get("reasons") or [f"HTTP {response.status_code}"]
+        return False, "; ".join(map(str, reasons))
+    except httpx.TimeoutException:
+        return False, f"readiness probe timed out after {timeout}s"
+    except httpx.HTTPError as exc:
+        return False, f"{type(exc).__name__}: {exc}"
 
 
 def run(interval: float, timeout: float, threshold: int, duration: float, out: pathlib.Path):
-    """TODO: vòng lặp poll + phát hiện transition + ghi JSONL."""
-    raise NotImplementedError
+    """Poll both regions and append one JSONL record per health-state transition."""
+    if interval <= 0 or timeout <= 0 or threshold < 1 or duration < 0:
+        raise ValueError("interval/timeout must be positive, threshold >= 1, duration >= 0")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    states = {region: "HEALTHY" for region in URL}
+    failures = {region: 0 for region in URL}
+    failure_started = {region: None for region in URL}
+    successes = {region: 0 for region in URL}
+    end = time.monotonic() + duration
+
+    with out.open("a", encoding="utf-8") as f, concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(URL)) as pool:
+        while time.monotonic() < end:
+            cycle_started = time.monotonic()
+            results = {region: future.result() for region, future in {
+                region: pool.submit(probe, region, timeout) for region in URL
+            }.items()}
+            for region, (ready, reason) in results.items():
+                if ready:
+                    failures[region] = 0
+                    failure_started[region] = None
+                    successes[region] += 1
+                    if states[region] == "UNHEALTHY" and successes[region] >= threshold:
+                        to = "HEALTHY"
+                    else:
+                        to = states[region]
+                else:
+                    if failures[region] == 0:
+                        failure_started[region] = time.monotonic()
+                    successes[region] = 0
+                    failures[region] += 1
+                    floor_elapsed = (failure_started[region] is not None and
+                                     time.monotonic() - failure_started[region] >= interval * threshold)
+                    if (states[region] == "HEALTHY" and failures[region] >= threshold
+                            and floor_elapsed):
+                        to = "UNHEALTHY"
+                    else:
+                        to = states[region]
+                if to != states[region]:
+                    rec = {
+                        "ts": time.time(),
+                        "iso": dt.datetime.now(dt.timezone.utc).isoformat(),
+                        "event": "state_change",
+                        "region": region,
+                        "from": states[region],
+                        "to": to,
+                        "reason": reason,
+                        "consecutive_fails": failures[region],
+                        "consecutive_successes": successes[region],
+                        "interval_s": interval,
+                        "threshold": threshold,
+                    }
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    f.flush()
+                    print("HEALTH", json.dumps(rec, ensure_ascii=False))
+                    states[region] = to
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(remaining, max(0.0, interval - (time.monotonic() - cycle_started))))
 
 
 if __name__ == "__main__":
